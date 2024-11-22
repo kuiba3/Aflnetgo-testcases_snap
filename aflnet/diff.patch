@@ -1,0 +1,961 @@
+diff --git a/afl-fuzz.c b/afl-fuzz.c
+index ad0c5a4..88374b5 100644
+--- a/afl-fuzz.c
++++ b/afl-fuzz.c
+@@ -104,7 +104,8 @@ EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
+           *in_bitmap,                 /* Input bitmap                     */
+           *doc_path,                  /* Path to documentation dir        */
+           *target_path,               /* Path to target binary            */
+-          *orig_cmdline;              /* Original command line            */
++          *orig_cmdline,              /* Original command line            */
++          *sbr_plugin_path;           /* Path to SaBRe's plugin to load   */
+ 
+ EXP_ST u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
+ static u32 hang_tmout = EXEC_TIMEOUT; /* Timeout used for hang det (ms)   */
+@@ -133,6 +134,7 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
+            shuffle_queue,             /* Shuffle input queue?             */
+            bitmap_changed = 1,        /* Time to update bitmap?           */
+            qemu_mode,                 /* Running in QEMU mode?            */
++           sbr_mode,                  /* Running in SaBRe mode?           */
+            skip_requested,            /* Skip request, via SIGUSR1        */
+            run_over10m,               /* Run time over 10 minutes?        */
+            persistent_mode,           /* Running in persistent mode?      */
+@@ -143,7 +145,11 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
+            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
+            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
+            fsrv_ctl_fd,               /* Fork server control pipe (write) */
+-           fsrv_st_fd;                /* Fork server status pipe (read)   */
++           fsrv_st_fd,                /* Fork server status pipe (read)   */
++           sbr_data_fd,               /* Transfere data to/from SaBRe     */
++           sbr_ctl_fd,                /* Understand state of SaBRe client */
++           sbr_data_fd_target,
++           sbr_ctl_fd_target;
+ 
+ static s32 forksrv_pid,               /* PID of the fork server           */
+            child_pid = -1,            /* PID of the fuzzed program        */
+@@ -650,7 +656,7 @@ unsigned int choose_target_state(u8 mode) {
+       selected_state_index = UR(state_ids_count);
+       result = state_ids[selected_state_index];
+       break;
+-    case ROUND_ROBIN: //Roud-robin state selection
++    case ROUND_ROBIN: //Round-robin state selection
+       result = state_ids[selected_state_index];
+       selected_state_index++;
+       if (selected_state_index == state_ids_count) selected_state_index = 0;
+@@ -981,6 +987,252 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
+   if (state_sequence) ck_free(state_sequence);
+ }
+ 
++#ifdef PRINT_BENCH
++static double get_current_time() {
++  struct timeval t;
++  gettimeofday(&t, 0);
++  return t.tv_sec + t.tv_usec*1e-6;
++}
++#else
++static double get_current_time() {
++  return 0.0;
++}
++#endif
++
++// NOTE: This needs to be in sync with SaBRe.
++typedef enum {
++  GetNext = -2,
++  Timeout = -1,
++  Send,
++  Recv
++} TargetAction;
++
++static boolean target_is_dead() {
++  int status = kill(child_pid, 0);
++  if (status == 0)
++    return FALSE;
++
++  status = kill(-child_pid, 0);
++  if (status != 0) {
++    if (errno == ESRCH) {
++      return TRUE;
++    } else {
++      PFATAL("target_is_dead");
++    }
++  }
++  return FALSE;
++}
++
++static TargetAction target_will_do() {
++  TargetAction ta = {0};
++  int rc, periodic_check = 0;
++  do {
++    rc = recv(sbr_ctl_fd, &ta, sizeof(TargetAction), MSG_DONTWAIT);
++    // TODO: Check for: EAGAIN, EWOULDBLOCK, EINTR?
++    periodic_check++;
++    if (periodic_check == 5) {
++      if (target_is_dead()) {
++        return Timeout;
++      }
++      periodic_check = 0;
++    }
++    if (child_timed_out || stop_soon) {
++      return Timeout;
++    }
++  } while (rc <= 0);
++  return ta;
++}
++
++static void emulate_disconnect() {
++  send(sbr_data_fd, "", 0, MSG_NOSIGNAL|MSG_DONTWAIT);
++}
++
++static void drain_pending_msgs() {
++  char buf[1000] = {0};
++  TargetAction ta = {0};
++  int rc;
++
++  boolean sent_sig_once = FALSE;
++  while (TRUE) {
++    do { // Keep draining while there are still messages.
++      rc = recv(sbr_ctl_fd, &ta, sizeof(TargetAction), MSG_DONTWAIT);
++      rc += recv(sbr_data_fd, buf, sizeof(buf), MSG_DONTWAIT);
++    } while (rc > -2);
++
++    if (target_is_dead()) {
++      do {
++        rc += recv(sbr_ctl_fd_target, buf, sizeof(buf), MSG_DONTWAIT);
++        rc += recv(sbr_data_fd_target, buf, sizeof(buf), MSG_DONTWAIT);
++      } while (rc > -2);
++
++      return;
++    } else if (terminate_child && (child_pid > 0) && !sent_sig_once) {
++      // TODO: Technically there is a race condition for when child_pid dies,
++      // the OS could possibly recycle the pid and we will be waiting (or worse,
++      // killing) an unrelated to us process.
++      kill(-child_pid, SIGTERM);
++      kill(child_pid, SIGTERM);
++      sent_sig_once = TRUE;
++    } else if (child_timed_out || stop_soon) {
++      return;
++    }
++  }
++}
++
++// TODO: Possible optimizations
++//       - Don't block on sbr_ctr_fd, try to loop (Done)
++//       - 2x drain_pending_msgs? We need them to clean channels
++//       - atomic sbr-protocol (Done)
++//       - kill sigkill vs sigterm vs 0
++//       - SEQ_protocol vs stream
++//       - New simpler inmem-FS
++//       - do we need ExitGroup afterall?
++
++int send_over_network_sbr() {
++  u8 likely_buggy = 0;
++
++  // Clean up the server if needed
++  if (cleanup_script)
++    system(cleanup_script);
++
++  // Clear the response buffer and reset the response buffer size
++  if (response_buf) {
++    ck_free(response_buf);
++    response_buf = NULL;
++    response_buf_size = 0;
++  }
++
++  if (response_bytes) {
++    ck_free(response_bytes);
++    response_bytes = NULL;
++  }
++
++  // Set timeout for socket data sending/receiving -- otherwise it causes a big
++  // delay if the server is still alive after processing all the requests
++  struct timeval to = {.tv_sec = 1};
++  setsockopt(sbr_data_fd, SOL_SOCKET, SO_SNDTIMEO, (char *)&to, sizeof(to));
++  setsockopt(sbr_data_fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&to, sizeof(to));
++  setsockopt(sbr_ctl_fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&to, sizeof(to));
++
++  double bstart_time = get_current_time();
++  TOKF("0 Conn: %lf %s", get_current_time() - bstart_time, response_buf);
++
++  // Retrieve early server response if needed.
++  bstart_time = get_current_time();
++  TargetAction ta = {0};
++  do {
++    ta = target_will_do();
++    if (ta == Send) {
++      ta = GetNext;
++      if (net_recv_sbr(sbr_data_fd, &response_buf, &response_buf_size) < 0)
++        goto HANDLE_RESPONSES;
++    } else if (ta == Recv) {
++      // There is not "hello" msg from the server.
++    } else if (ta == Timeout) {
++      goto HANDLE_RESPONSES;
++    } else {
++      PFATAL("Unexpected TargetAction: %d", ta);
++    }
++  } while (ta == GetNext);
++  TOKF("1 Recv: %lf %s", get_current_time() - bstart_time, response_buf);
++
++  // write the request messages
++  messages_sent = 0;
++  for (kliter_t(lms) *it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
++    bstart_time = get_current_time();
++    int n = 0;
++    if (ta == Recv) {
++      ta = GetNext;
++      n = net_send_sbr(sbr_data_fd, kl_val(it)->mdata, kl_val(it)->msize);
++      if (n != kl_val(it)->msize) {
++        if ((n == -1) && (errno == EMSGSIZE)) {
++          // WARNF("SOCK_SEQPACKET doesn't support such long msgs: %u", kl_val(it)->msize);
++        } else {
++          WARNF("Failed to send msg with length: %u, actual: %d, errno: %s", kl_val(it)->msize, n, strerror(errno));
++        }
++        emulate_disconnect();
++        // ta = target_will_do();
++        goto HANDLE_RESPONSES;
++      }
++      messages_sent++;
++    } else {
++      PFATAL("Unexpected TargetAction: %d", ta);
++    }
++    TOKF("2 Send: %lf %d msg: %s", get_current_time() - bstart_time, n, kl_val(it)->mdata);
++
++    // Allocate memory to store new accumulated response buffer size
++    if (messages_sent * sizeof(u32) >= MAX_ALLOC) {
++        emulate_disconnect();
++        goto HANDLE_RESPONSES;
++    }
++    response_bytes = (u32 *)ck_realloc(response_bytes, messages_sent * sizeof(u32));
++
++    // retrieve server response
++    u32 prev_buf_size = response_buf_size;
++
++    bstart_time = get_current_time();
++    do {
++      if (ta == GetNext)
++        ta = target_will_do();
++
++      if (ta == Send) {
++        ta = GetNext;
++        if (net_recv_sbr(sbr_data_fd, &response_buf, &response_buf_size) < 0) {
++          goto HANDLE_RESPONSES;
++        }
++      } else if (ta == Timeout) {
++        response_bytes[messages_sent - 1] = response_buf_size;
++        if (prev_buf_size == response_buf_size)
++          likely_buggy = 1;
++        else
++          likely_buggy = 0;
++        goto HANDLE_RESPONSES;
++      } else if (ta == Recv) {
++        // Target is ready to accept msgs. Go to next iteration.
++      } else {
++        PFATAL("Unexpected TargetAction: %d", ta);
++      }
++    } while (ta == GetNext);
++    TOKF("3 Recv: %lf %s", get_current_time() - bstart_time, response_buf);
++
++    // Update accumulated response buffer size
++    response_bytes[messages_sent - 1] = response_buf_size;
++
++    // set likely_buggy flag if AFLNet does not receive any feedback from the
++    // server it could be a signal of a potentiall server crash, like the case
++    // of CVE-2019-7314
++    if (prev_buf_size == response_buf_size)
++      likely_buggy = 1;
++    else
++      likely_buggy = 0;
++  }
++
++  // We are done with messages, let's close the connection.
++  if (ta == Recv) {
++    emulate_disconnect();
++  } else {
++    PFATAL("We are exiting with action: %d", ta);
++  }
++
++HANDLE_RESPONSES:
++  // Drain sockets and check for remnants
++  bstart_time = get_current_time();
++  drain_pending_msgs();
++  TOKF("4 Recv: %lf %s", get_current_time() - bstart_time, response_buf);
++
++  if (messages_sent > 0 && response_bytes != NULL) {
++    response_bytes[messages_sent - 1] = response_buf_size;
++  }
++
++  if (likely_buggy && false_negative_reduction)
++    return 0;
++
++  bstart_time = get_current_time();
++  TOKF("5 Kill: %lf\n%s", get_current_time() - bstart_time, response_buf);
++
++  return 0;
++}
++
+ /* Send (mutated) messages in order to the server under test */
+ int send_over_network()
+ {
+@@ -1007,6 +1259,7 @@ int send_over_network()
+     response_bytes = NULL;
+   }
+ 
++  double bstart_time = get_current_time();
+   //Create a TCP/UDP socket
+   int sockfd = -1;
+   if (net_protocol == PRO_TCP)
+@@ -1032,7 +1285,7 @@ int send_over_network()
+   serv_addr.sin_addr.s_addr = inet_addr(net_ip);
+ 
+   //This piece of code is only used for targets that send responses to a specific port number
+-  //The Kamailio SIP server is an example. After running this code, the intialized sockfd 
++  //The Kamailio SIP server is an example. After running this code, the intialized sockfd
+   //will be bound to the given local port
+   if(local_port > 0) {
+     local_serv_addr.sin_family = AF_INET;
+@@ -1057,16 +1310,21 @@ int send_over_network()
+       return 1;
+     }
+   }
++  TOKF("1 Conn: %lf", get_current_time() - bstart_time);
+ 
+   //retrieve early server response if needed
++  bstart_time = get_current_time();
+   if (net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size)) goto HANDLE_RESPONSES;
++  TOKF("1 Recv: %lf %s", get_current_time() - bstart_time, response_buf);
+ 
+   //write the request messages
+   kliter_t(lms) *it;
+   messages_sent = 0;
+ 
+   for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
++    bstart_time = get_current_time();
+     n = net_send(sockfd, timeout, kl_val(it)->mdata, kl_val(it)->msize);
++    TOKF("2 Send: %lf %d msg: %s", get_current_time() - bstart_time, n, kl_val(it)->mdata);
+     messages_sent++;
+ 
+     //Allocate memory to store new accumulated response buffer size
+@@ -1079,9 +1337,11 @@ int send_over_network()
+ 
+     //retrieve server response
+     u32 prev_buf_size = response_buf_size;
++    bstart_time = get_current_time();
+     if (net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size)) {
+       goto HANDLE_RESPONSES;
+     }
++    TOKF("3 Recv: %lf %s", get_current_time() - bstart_time, response_buf);
+ 
+     //Update accumulated response buffer size
+     response_bytes[messages_sent - 1] = response_buf_size;
+@@ -1094,7 +1354,9 @@ int send_over_network()
+ 
+ HANDLE_RESPONSES:
+ 
++  bstart_time = get_current_time();
+   net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size);
++  TOKF("4 Recv: %lf %s", get_current_time() - bstart_time, response_buf);
+ 
+   if (messages_sent > 0 && response_bytes != NULL) {
+     response_bytes[messages_sent - 1] = response_buf_size;
+@@ -1110,6 +1372,7 @@ HANDLE_RESPONSES:
+ 
+   if (likely_buggy && false_negative_reduction) return 0;
+ 
++  bstart_time = get_current_time();
+   if (terminate_child && (child_pid > 0)) kill(child_pid, SIGTERM);
+ 
+   //give the server a bit more time to gracefully terminate
+@@ -1117,6 +1380,7 @@ HANDLE_RESPONSES:
+     int status = kill(child_pid, 0);
+     if ((status != 0) && (errno == ESRCH)) break;
+   }
++  TOKF("5 Kill: %lf", get_current_time() - bstart_time);
+ 
+   return 0;
+ }
+@@ -2839,7 +3103,7 @@ static void destroy_extras(void) {
+ EXP_ST void init_forkserver(char** argv) {
+ 
+   static struct itimerval it;
+-  int st_pipe[2], ctl_pipe[2];
++  int st_pipe[2], ctl_pipe[2], sbr_data[2], sbr_ctl[2];
+   int status;
+   s32 rlen;
+ 
+@@ -2847,6 +3111,13 @@ EXP_ST void init_forkserver(char** argv) {
+ 
+   if (pipe(st_pipe) || pipe(ctl_pipe)) PFATAL("pipe() failed");
+ 
++  if (socketpair(AF_LOCAL, SOCK_SEQPACKET, 0, sbr_data) != 0) {
++    PFATAL("socketpair() failed");
++  }
++  if (socketpair(AF_LOCAL, SOCK_SEQPACKET, 0, sbr_ctl) != 0) {
++    PFATAL("socketpair() failed");
++  }
++
+   forksrv_pid = fork();
+ 
+   if (forksrv_pid < 0) PFATAL("fork() failed");
+@@ -2891,7 +3162,10 @@ EXP_ST void init_forkserver(char** argv) {
+ 
+     r.rlim_max = r.rlim_cur = 0;
+ 
++#ifdef CORE_BENCH
++#else
+     setrlimit(RLIMIT_CORE, &r); /* Ignore errors */
++#endif
+ 
+     /* Isolate the process and configure standard descriptors. If out_file is
+        specified, stdin is /dev/null; otherwise, out_fd is cloned instead. */
+@@ -2899,7 +3173,10 @@ EXP_ST void init_forkserver(char** argv) {
+     setsid();
+ 
+     dup2(dev_null_fd, 1);
++#ifdef CORE_BENCH
++#else
+     dup2(dev_null_fd, 2);
++#endif
+ 
+     if (out_file) {
+ 
+@@ -2917,10 +3194,23 @@ EXP_ST void init_forkserver(char** argv) {
+     if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
+     if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");
+ 
++    // Setup communication with SaBRe.
++    if (dup2(sbr_data[1], SABRE_DATA_SOCKET) != SABRE_DATA_SOCKET) {
++      PFATAL("dup2() failed");
++    }
++    if (dup2(sbr_ctl[1], SABRE_CTL_SOCKET) != SABRE_CTL_SOCKET) {
++      PFATAL("dup2() failed");
++    }
++
++
+     close(ctl_pipe[0]);
+     close(ctl_pipe[1]);
+     close(st_pipe[0]);
+     close(st_pipe[1]);
++    close(sbr_data[0]);
++    close(sbr_data[1]);
++    close(sbr_ctl[0]);
++    close(sbr_ctl[1]);
+ 
+     close(out_dir_fd);
+     close(dev_null_fd);
+@@ -2963,9 +3253,29 @@ EXP_ST void init_forkserver(char** argv) {
+   close(ctl_pipe[0]);
+   close(st_pipe[1]);
+ 
++  sbr_data_fd_target = sbr_data[1];
++  sbr_ctl_fd_target = sbr_ctl[1];
++
++  sbr_data_fd = sbr_data[0];
++  sbr_ctl_fd = sbr_ctl[0];
+   fsrv_ctl_fd = ctl_pipe[1];
+   fsrv_st_fd  = st_pipe[0];
+ 
++  if (sbr_mode) {
++    char rsp[1024] = {0};
++    char expected[] = "hello from sbr";
++    int rc = recv(sbr_ctl_fd, rsp, 1024, 0);
++    if (strncmp(rsp, expected, sizeof(expected)) != 0 || rc != sizeof(expected))
++      PFATAL("sbr recv failed");
++
++    char msg[] = "hello from afl";
++    rc = send(sbr_ctl_fd, msg, sizeof(msg), MSG_NOSIGNAL);
++    if (rc != sizeof(msg))
++      PFATAL("sbr send failed");
++
++    OKF("SaBRe handshake OK!");
++  }
++
+   /* Wait for the fork server to come up, but don't wait too long. */
+ 
+   it.it_value.tv_sec = ((exec_tmout * FORK_WAIT_MULT) / 1000);
+@@ -3256,11 +3566,23 @@ static u8 run_target(char** argv, u32 timeout) {
+   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
+ 
+   if (dumb_mode == 1 || no_forkserver) {
+-    if (use_net) send_over_network();
++    if (sbr_mode) {
++      send_over_network_sbr();
++    } else if (use_net) {
++      send_over_network();
++    }
+     if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
+ 
+   } else {
+-    if (use_net) send_over_network();
++    if (sbr_mode) {
++      double bstart_time = get_current_time();
++      send_over_network_sbr();
++      TOKF("0 Total: %lf", get_current_time() - bstart_time);
++    } else if (use_net) {
++      double bstart_time = get_current_time();
++      send_over_network();
++      TOKF("0 Total: %lf", get_current_time() - bstart_time);
++    }
+     s32 res;
+ 
+     if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
+@@ -3284,6 +3606,18 @@ static u8 run_target(char** argv, u32 timeout) {
+   setitimer(ITIMER_REAL, &it, NULL);
+ 
+   total_execs++;
++#ifdef LONG_BENCH
++#elif SHORT_BENCH
++  if (total_execs == 1000) {
++    OKF("Snapfuzz-bench: Done!");
++    raise(SIGINT);
++  }
++#else
++  if (total_execs == 1000000) {
++    OKF("Snapfuzz-bench: Done!");
++    raise(SIGINT);
++  }
++#endif
+ 
+   /* Any subsequent operations on trace_bits must not be moved by the
+      compiler below this point. Past this location, trace_bits[] behave
+@@ -3311,6 +3645,9 @@ static u8 run_target(char** argv, u32 timeout) {
+ 
+     if (kill_signal == SIGTERM) return FAULT_NONE;
+ 
++#ifdef CORE_BENCH
++    WARNF("Snapfuzz crashed? %d", kill_signal);
++#endif
+     return FAULT_CRASH;
+ 
+   }
+@@ -4283,7 +4620,7 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
+              "exec_timeout      : %u\n" /* Must match find_timeout() */
+              "afl_banner        : %s\n"
+              "afl_version       : " VERSION "\n"
+-             "target_mode       : %s%s%s%s%s%s%s\n"
++             "target_mode       : %s%s%s%s%s%s%s%s\n"
+              "command_line      : %s\n"
+              "slowest_exec_ms   : %llu\n",
+              start_time / 1000, get_cur_time() / 1000, getpid(),
+@@ -4294,10 +4631,10 @@ static void write_stats_file(double bitmap_cvg, double stability, double eps) {
+              unique_hangs, last_path_time / 1000, last_crash_time / 1000,
+              last_hang_time / 1000, total_execs - last_crash_execs,
+              exec_tmout, use_banner,
+-             qemu_mode ? "qemu " : "", dumb_mode ? " dumb " : "",
++             qemu_mode ? "qemu " : "", sbr_mode ? "sabre " : "", dumb_mode ? " dumb " : "",
+              no_forkserver ? "no_forksrv " : "", crash_mode ? "crash " : "",
+              persistent_mode ? "persistent " : "", deferred_mode ? "deferred " : "",
+-             (qemu_mode || dumb_mode || no_forkserver || crash_mode ||
++             (qemu_mode || sbr_mode || dumb_mode || no_forkserver || crash_mode ||
+               persistent_mode || deferred_mode) ? "" : "default",
+              orig_cmdline, slowest_exec_ms);
+              /* ignore errors */
+@@ -7764,8 +8101,9 @@ static void handle_stop_sig(int sig) {
+ 
+   stop_soon = 1;
+ 
++  if (child_pid > 0) kill(-child_pid, SIGKILL);
+   if (child_pid > 0) kill(child_pid, SIGKILL);
+-  if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
++  if (forksrv_pid > 0) kill(-forksrv_pid, SIGKILL);
+ 
+ }
+ 
+@@ -7785,12 +8123,13 @@ static void handle_timeout(int sig) {
+   if (child_pid > 0) {
+ 
+     child_timed_out = 1;
++    kill(-child_pid, SIGKILL);
+     kill(child_pid, SIGKILL);
+ 
+   } else if (child_pid == -1 && forksrv_pid > 0) {
+ 
+     child_timed_out = 1;
+-    kill(forksrv_pid, SIGKILL);
++    kill(-forksrv_pid, SIGKILL);
+ 
+   }
+ 
+@@ -7949,7 +8288,7 @@ EXP_ST void check_binary(u8* fname) {
+ 
+   }
+ 
+-  if (memmem(f_data, f_len, DEFER_SIG, strlen(DEFER_SIG) + 1)) {
++  if (memmem(f_data, f_len, DEFER_SIG, strlen(DEFER_SIG) + 1) || sbr_mode) {
+ 
+     OKF(cPIN "Deferred forkserver binary detected.");
+     setenv(DEFER_ENV_VAR, "1", 1);
+@@ -8630,6 +8969,19 @@ EXP_ST void setup_signal_handlers(void) {
+ 
+ }
+ 
++/* Rewrite argv for SaBRe. */
++
++static char** get_sbr_argv(char** argv, int argc) {
++  char** new_argv = ck_alloc(sizeof(char*) * (argc + 3 + 1));
++
++  memcpy(new_argv + 3, argv, sizeof(char*) * argc);
++
++  new_argv[2] = "--";
++  new_argv[1] = sbr_plugin_path;
++  target_path = new_argv[0] = ck_strdup("./sabre");
++
++  return new_argv;
++}
+ 
+ /* Rewrite argv for QEMU. */
+ 
+@@ -8756,7 +9108,7 @@ int main(int argc, char** argv) {
+   gettimeofday(&tv, &tz);
+   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
+ 
+-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:P:KEq:s:RFc:l:")) > 0)
++  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:A:D:W:w:P:KEq:s:RFc:l:")) > 0)
+ 
+     switch (opt) {
+ 
+@@ -8924,6 +9276,13 @@ int main(int argc, char** argv) {
+ 
+         break;
+ 
++      case 'A': /* SaBRe mode */
++        if (sbr_mode) FATAL("Multiple -A options not supported");
++        sbr_plugin_path = optarg;
++
++        sbr_mode = 1;
++        break;
++
+       case 'N': /* Network configuration */
+         if (use_net) FATAL("Multiple -N options not supported");
+         if (parse_net_config(optarg, &net_protocol, &net_ip, &net_port)) FATAL("Bad syntax used for -N. Check the network setting. [tcp/udp]://127.0.0.1/port");
+@@ -9048,7 +9407,7 @@ int main(int argc, char** argv) {
+   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
+ 
+   //AFLNet - Check for required arguments
+-  if (!use_net) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
++  if (!use_net && !sbr_mode) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
+ 
+   if (!protocol_selected) FATAL("Please specify the protocol to be tested using the -P option");
+ 
+@@ -9098,7 +9457,10 @@ int main(int argc, char** argv) {
+   get_core_count();
+ 
+ #ifdef HAVE_AFFINITY
++#ifdef NOAFFIN_BENCH
++#else
+   bind_to_free_cpu();
++#endif
+ #endif /* HAVE_AFFINITY */
+ 
+   check_crash_handling();
+@@ -9128,13 +9490,20 @@ int main(int argc, char** argv) {
+ 
+   start_time = get_cur_time();
+ 
+-  if (qemu_mode)
++  if (sbr_mode)
++    use_argv = get_sbr_argv(argv + optind, argc - optind);
++  else if (qemu_mode)
+     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
+   else
+     use_argv = argv + optind;
+ 
+   perform_dry_run(use_argv);
+ 
++#ifdef PRINT_BENCH
++  TOKF("Snapfuzz-bench-print: Done!");
++  raise(SIGINT);
++#endif
++
+   cull_queue();
+ 
+   show_init_stats();
+@@ -9280,8 +9649,9 @@ int main(int argc, char** argv) {
+   /* If we stopped programmatically, we kill the forkserver and the current runner.
+      If we stopped manually, this is done by the signal handler. */
+   if (stop_soon == 2) {
++      if (child_pid > 0) kill(-child_pid, SIGKILL);
+       if (child_pid > 0) kill(child_pid, SIGKILL);
+-      if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
++      if (forksrv_pid > 0) kill(-forksrv_pid, SIGKILL);
+   }
+   /* Now that we've killed the forkserver, we wait for it to be able to get rusage stats. */
+   if (waitpid(forksrv_pid, NULL, 0) <= 0) {
+diff --git a/aflnet.c b/aflnet.c
+index 86af7e0..fefd788 100644
+--- a/aflnet.c
++++ b/aflnet.c
+@@ -1215,6 +1215,10 @@ unsigned int* extract_response_codes_dtls12(unsigned char* buf, unsigned int buf
+         }
+       }
+ 
++      if ((state_count+1) * sizeof(unsigned int) >= MAX_ALLOC) {
++        *state_count_ref = state_count;
++        return state_sequence;
++      }
+       status_code = (content_type << 8) + message_type;
+       state_count++;
+       state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+@@ -1692,6 +1696,34 @@ int net_recv(int sockfd, struct timeval timeout, int poll_w, char **response_buf
+   return 0;
+ }
+ 
++int net_send_sbr(int sockfd, char *mem, unsigned int len)
++{
++  // TODO(andronat): Do we need MSG_EOR and MSG_DONTWAIT?
++  // TODO(andronat): Warn user if /proc/sys/net/core/wmem_default is too small.
++  return send(sockfd, mem, len, MSG_NOSIGNAL);
++}
++
++// TODO(andronat): temp_buf should equal to /proc/sys/net/core/rmem_default.
++static char temp_buf[250000] = {0};
++
++int net_recv_sbr(int sockfd, char **response_buf, unsigned int *len)
++{
++  int n = recv(sockfd, temp_buf, sizeof(temp_buf), 0);
++  if (n <= 0)
++    return -1;
++
++  *response_buf = (unsigned char *)ck_realloc(*response_buf, *len + n + 1);
++  memcpy(&(*response_buf)[*len], temp_buf, n);
++  (*response_buf)[(*len) + n] = '\0';
++  *len = *len + n;
++  return n;
++}
++
++// Q: Why did we implement the guiding system with sbr_ctl_fd?
++// A: This won't work... POLLOUT is always there even if socket is closed.
++// Curious case: if socket is closed, poll will return events and we need
++// to check send's errno and receieve will always return 0 len strings.
++
+ // Utility function
+ 
+ void save_regions_to_file(region_t *regions, unsigned int region_count, unsigned char *fname)
+diff --git a/aflnet.h b/aflnet.h
+index 99ccf0f..5f528bf 100644
+--- a/aflnet.h
++++ b/aflnet.h
+@@ -90,6 +90,9 @@ extern region_t* (*extract_requests)(unsigned char* buf, unsigned int buf_size,
+ int net_send(int sockfd, struct timeval timeout, char *mem, unsigned int len);
+ int net_recv(int sockfd, struct timeval timeout, int poll_w, char **response_buf, unsigned int *len);
+ 
++int net_recv_sbr(int sockfd, char **response_buf, unsigned int *len);
++int net_send_sbr(int sockfd, char *mem, unsigned int len);
++
+ // kl_messages manipulating functions
+ 
+ /* Construct a new linked list to store all messages from a list of regions */
+diff --git a/alloc-inl.h b/alloc-inl.h
+index 9a68126..69a7a58 100644
+--- a/alloc-inl.h
++++ b/alloc-inl.h
+@@ -166,6 +166,7 @@ static inline void DFL_ck_free(void* mem) {
+ /* Re-allocate a buffer, checking for issues and zeroing any newly-added tail.
+    With DEBUG_BUILD, the buffer is always reallocated to a new addresses and the
+    old memory is clobbered with 0xFF. */
++#include <unistd.h>
+ 
+ static inline void* DFL_ck_realloc(void* orig, u32 size) {
+ 
+@@ -194,6 +195,12 @@ static inline void* DFL_ck_realloc(void* orig, u32 size) {
+ 
+   }
+ 
++  if (size > MAX_ALLOC) {
++    for(;;) {
++      WARNF("AMAN! %d", size);
++      sleep(10);
++    }
++  }
+   ALLOC_CHECK_SIZE(size);
+ 
+ #ifndef DEBUG_BUILD
+@@ -298,7 +305,7 @@ static inline void* DFL_ck_memdup(void* mem, u32 size) {
+   ALLOC_CHECK_SIZE(size);
+   ret = malloc(size + ALLOC_OFF_TOTAL);
+   ALLOC_CHECK_RESULT(ret, size);
+-  
++
+   ret += ALLOC_OFF_HEAD;
+ 
+   ALLOC_C1(ret) = ALLOC_MAGIC_C1;
+@@ -322,7 +329,7 @@ static inline u8* DFL_ck_memdup_str(u8* mem, u32 size) {
+   ALLOC_CHECK_SIZE(size);
+   ret = malloc(size + ALLOC_OFF_TOTAL + 1);
+   ALLOC_CHECK_RESULT(ret, size);
+-  
++
+   ret += ALLOC_OFF_HEAD;
+ 
+   ALLOC_C1(ret) = ALLOC_MAGIC_C1;
+diff --git a/config.h b/config.h
+index b21298d..5c6ad27 100644
+--- a/config.h
++++ b/config.h
+@@ -101,7 +101,7 @@
+ #define HAVOC_MIN           16
+ 
+ /* Maximum stacking for havoc-stage tweaks. The actual value is calculated
+-   like this: 
++   like this:
+ 
+    n = random between 1 and HAVOC_STACK_POW2
+    stacking = 2^n
+@@ -303,6 +303,10 @@
+ 
+ #define FORKSRV_FD          198
+ 
++/* SaBRe file descriptors */
++#define SABRE_DATA_SOCKET (FORKSRV_FD + 2)
++#define SABRE_CTL_SOCKET (SABRE_DATA_SOCKET + 1)
++
+ /* Fork server init timeout multiplier: we'll wait the user-selected
+    timeout plus this much for the fork server to spin up. */
+ 
+diff --git a/debug.h b/debug.h
+index 5f75974..2bd2cf1 100644
+--- a/debug.h
++++ b/debug.h
+@@ -169,7 +169,7 @@
+ 
+ #ifdef MESSAGES_TO_STDOUT
+ #  define SAYF(x...)    printf(x)
+-#else 
++#else
+ #  define SAYF(x...)    fprintf(stderr, x)
+ #endif /* ^MESSAGES_TO_STDOUT */
+ 
+@@ -187,6 +187,18 @@
+     SAYF(cRST "\n"); \
+   } while (0)
+ 
++#ifdef PRINT_BENCH
++#define TOKF(x...)                                                             \
++  do {                                                                         \
++    SAYF(cLGN "[+] TASO " cRST x);                                             \
++    SAYF(cRST "\n");                                                           \
++  } while (0)
++#else
++#define TOKF(x...)                                                             \
++  do {                                                                         \
++  } while (0)
++#endif
++
+ /* Show a prefixed "success" message. */
+ 
+ #define OKF(x...) do { \
+diff --git a/llvm_mode/afl-clang-fast.c b/llvm_mode/afl-clang-fast.c
+index c154e01..f9d4df0 100644
+--- a/llvm_mode/afl-clang-fast.c
++++ b/llvm_mode/afl-clang-fast.c
+@@ -95,7 +95,7 @@ static void find_obj(u8* argv0) {
+   }
+ 
+   FATAL("Unable to find 'afl-llvm-rt.o' or 'afl-llvm-pass.so'. Please set AFL_PATH");
+- 
++
+ }
+ 
+ 
+@@ -221,6 +221,9 @@ static void edit_params(u32 argc, char** argv) {
+ 
+   }
+ 
++  // TODO: Should we replace this with --dynamic-list?
++  cc_params[cc_par_cnt++] = "-rdynamic";
++
+   if (getenv("AFL_NO_BUILTIN")) {
+ 
+     cc_params[cc_par_cnt++] = "-fno-builtin-strcmp";
+diff --git a/llvm_mode/afl-llvm-rt.o.c b/llvm_mode/afl-llvm-rt.o.c
+index 60475c9..7482afc 100644
+--- a/llvm_mode/afl-llvm-rt.o.c
++++ b/llvm_mode/afl-llvm-rt.o.c
+@@ -144,7 +144,7 @@ static void __afl_start_forkserver(void) {
+         close(FORKSRV_FD);
+         close(FORKSRV_FD + 1);
+         return;
+-  
++
+       }
+ 
+     } else {
+diff --git a/tutorials/lightftp/Dockerfile b/tutorials/lightftp/Dockerfile
+index 703a7f9..917bf0b 100644
+--- a/tutorials/lightftp/Dockerfile
++++ b/tutorials/lightftp/Dockerfile
+@@ -1,15 +1,23 @@
+-FROM ubuntu:16.04
++FROM ubuntu:18.04
+ 
+ # Install common dependencies
+ RUN apt-get -y update && \
+-    apt-get -y install sudo \ 
++    apt-get -y install sudo \
+     apt-utils \
+     build-essential \
+     openssl \
+     clang \
+     graphviz-dev \
+     git \
+-    libgnutls-dev
++    libgnutls28-dev
++
++RUN apt-get -y install libc6-dbg glibc-source libasan4-dbg gcc-7-source vim
++
++RUN apt-get -y install sudo apt-utils build-essential openssl clang \
++    libgraphviz-dev git libgnutls28-dev ntp libseccomp-dev libtool gettext \
++    libssl-dev pkg-config libini-config-dev autoconf \
++    linux-tools-common linux-tools-generic linux-cloud-tools-generic llvm tcl \
++    efibootmgr python3-pip rustc rust-src cmake
+ 
+ # Add a new user ubuntu, pass: ubuntu
+ RUN groupadd ubuntu && \
+@@ -20,12 +28,12 @@ USER ubuntu
+ WORKDIR /home/ubuntu
+ 
+ # Download and compile AFLNet
+-ENV LLVM_CONFIG="llvm-config-3.8"
++ENV LLVM_CONFIG="llvm-config-6.0"
+ 
+-RUN git clone https://github.com/aflnet/aflnet && \
++RUN git clone https://github.com/andronat/aflnet && \
+     cd aflnet && \
+     make clean all && \
+-    cd llvm_mode make && make
++    cd llvm_mode && make
+ 
+ # Set up environment variables for AFLNet
+ ENV AFLNET="/home/ubuntu/aflnet"
+@@ -49,3 +57,33 @@ RUN cd /home/ubuntu/LightFTP/Source/Release && \
+     cp ${AFLNET}/tutorials/lightftp/ftpclean.sh ./ && \
+     cp -r ${AFLNET}/tutorials/lightftp/certificate ~/ && \
+     mkdir ~/ftpshare
++
++RUN cd /home/ubuntu && \
++    V="1.0.18" && \
++    wget "https://download.libsodium.org/libsodium/releases/libsodium-${V}.tar.gz" && \
++    tar xzf "libsodium-${V}.tar.gz" && \
++    cd "libsodium-${V}" && \
++    ./configure && \
++    make && make check && \
++    sudo make install
++
++RUN cd /home/ubuntu && \
++    git clone https://github.com/zboxfs/zbox-c && \
++    cd zbox-c && \
++    mkdir -p m4 && \
++    ./autogen.sh && \
++    ./configure && \
++    make && make check && \
++    sudo make install
++
++# Download and compile SaBRe
++RUN cd /home/ubuntu && \
++    git clone --single-branch --branch snapfuzz_2.0 https://github.com/andronat/SaBRe.git && \
++    cd SaBRe && \
++    mkdir build && \
++    cd build && \
++    cmake .. && \
++    make
++
++# cp ~/snapfuzz/SaBRe/build/sabre .
++# cp ~/snapfuzz/SaBRe/build/plugins/sbr-zbox/libsbr-zbox.so .

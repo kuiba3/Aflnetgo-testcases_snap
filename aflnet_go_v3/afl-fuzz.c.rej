@@ -1,0 +1,11 @@
+--- afl-fuzz.c
++++ afl-fuzz.c
+@@ -9621,7 +9666,7 @@ int main(int argc, char** argv) {
+ //aflnet_go
+ //  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:")) > 0)
+ //  param b is AFLGO's c
+-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Qz:b:N:D:W:w:e:P:KEq:s:RFc:l:U:")) > 0)
++  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:Qz:b:N:D:W:w:e:P:KEq:s:RFc:l:U:Z:")) > 0)
+ //aflnet_go#
+     switch (opt) {
+ 

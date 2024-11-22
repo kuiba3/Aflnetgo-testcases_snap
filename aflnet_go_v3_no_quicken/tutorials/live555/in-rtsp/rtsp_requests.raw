@@ -1,0 +1,4 @@
+SETUP rtsp://:1/wavAudioTest/track1 RTSP/1.0^M
+CSeq: 3^M
+Transport: RTP/AVP/TCP;
+Range: npt=9
